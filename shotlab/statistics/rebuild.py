@@ -12,7 +12,8 @@ from .model import digest
 
 def staging_directory(context, cache_dir, parameters):
     from pathlib import Path
-    identity = digest([context.source_identity['key'], parameters.method(), asdict(SummaryParameters())])
+    scope = [context.scope] if context.scoped else []
+    identity = digest([context.source_identity['key'], parameters.method(), asdict(SummaryParameters()), *scope])
     return (Path(cache_dir) if cache_dir is not None else default_cache_directory()) / 'rebuild' / identity
 
 
@@ -59,20 +60,25 @@ def analyze_or_rebuild(context, cache_dir, parameters=ColorParameters(), *, rebu
                     still['file'] = names[still['file']]
             rows.append((key, target.encode(value)))
         db = target.connection
+        # Prepare CPU work and staging reads before the short publication transaction.
+        features = list(pending.connection.execute('SELECT * FROM features WHERE source=? AND method=?', (source,method)))
+        frames = ([row[2] for row in features] if context.scoped else
+                  [n for n, in db.execute('SELECT frame FROM features WHERE source=? AND method=?', (source,method))])
+        stale = {digest([source,method,n,parameters.palette_colors,parameters.palette_iterations,'frame-palette-v1']) for n in frames}
+        for key,payload in list(db.execute('SELECT key,payload FROM results')):
+            try:
+                value = target.decode(payload)
+                metadata = value.get('metadata', {})
+                if (metadata.get('source_identity', {}).get('key') == source
+                        and (not context.scoped or metadata.get('scope') == context.scope)):
+                    stale.add(key)
+            except (ValueError, zlib.error):
+                pass  # A corrupt matching key is replaced by the new validated group below.
+        check_cancel(cancel)
         with db:
-            # Includes legacy single-frame palette keys, whose payload lacked source metadata.
-            frames = [n for n, in db.execute('SELECT frame FROM features WHERE source=? AND method=?', (source,method))]
-            stale = {digest([source,method,n,parameters.palette_colors,parameters.palette_iterations,'frame-palette-v1']) for n in frames}
-            for key,payload in db.execute('SELECT key,payload FROM results'):
-                try:
-                    value = target.decode(payload)
-                    if value.get('metadata',{}).get('source_identity',{}).get('key') == source:
-                        stale.add(key)
-                except (ValueError, zlib.error):
-                    pass  # A corrupt matching key is replaced by the new validated group below.
             db.executemany('DELETE FROM results WHERE key=?', ((k,) for k in stale))
-            db.execute('DELETE FROM features WHERE source=? AND method=?', (source,method))
-            features = pending.connection.execute('SELECT * FROM features WHERE source=? AND method=?', (source,method))
+            if not context.scoped:
+                db.execute('DELETE FROM features WHERE source=? AND method=?', (source,method))
             db.executemany('INSERT OR REPLACE INTO features VALUES (?,?,?,?)', features)
             db.executemany('INSERT OR REPLACE INTO results VALUES (?,?)', rows)
             check_cancel(cancel)

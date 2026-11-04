@@ -14,7 +14,6 @@ import numpy as np
 from t0.media import FrameReader
 from .cache import ColorCache
 from .model import contiguous_blocks, digest
-from .shots import grid
 
 
 class UnsupportedColor(ValueError):
@@ -155,13 +154,24 @@ class ColorSource:
         frame = self.reader.read(number)
         if frame.rotation or self.reader.stream.sample_aspect_ratio not in (None, 0, 1):
             raise UnsupportedColor("Rotation / non-square pixels are not certified for color analysis")
-        if frame.color_trc in (16, 18) or frame.color_primaries == 9:
+        if frame.color_trc in (16, 18) or frame.color_primaries == 9 or frame.colorspace in (9, 10):
             raise UnsupportedColor("HDR / BT.2020 analysis is unsupported; no SDR tone mapping is assumed")
-        if frame.colorspace not in (0, 1, 5, 6) or frame.color_range not in (1, 2):
-            raise UnsupportedColor("Unknown or unsupported color matrix/range")
         if frame.color_trc not in (1, 2, 6, 13) or frame.color_primaries not in (1, 2):
             raise UnsupportedColor("Unsupported transfer function or RGB primaries")
         warnings = []
+        matrix, source_range = frame.colorspace, frame.color_range
+        # Unspecified tags are common in SDR YUV exports. Preserve explicit tags and
+        # keep the fallback visible in the result metadata as an approximation.
+        pixel_format = frame.format.name
+        if pixel_format.startswith(("yuv", "nv12", "nv21", "p010", "p016", "uyvy", "yuyv")):
+            if matrix == 2:
+                matrix = 6 if frame.height <= 576 and frame.width <= 1024 else 1
+                warnings.append("Unspecified YUV matrix: assume BT.601 for SD, BT.709 otherwise")
+            if source_range == 0:
+                source_range = 2 if pixel_format.startswith("yuvj") else 1
+                warnings.append("Unspecified YUV range: assume limited except full-range YUVJ")
+        if matrix not in (0, 1, 5, 6) or source_range not in (1, 2):
+            raise UnsupportedColor("Unknown or unsupported color matrix/range")
         if frame.color_primaries == 2:
             warnings.append("Unspecified primaries: assume Rec.709/sRGB D65")
         if frame.color_trc == 2:
@@ -169,8 +179,8 @@ class ColorSource:
         width = min(frame.width, self.parameters.sample_width)
         height = max(1, round(frame.height * width / frame.width))
         rgb = self.reformatter.reformat(frame, width=width, height=height, format="rgb48le",
-                                       src_colorspace="ITU601" if frame.colorspace in (5, 6) else "ITU709",
-                                       src_color_range=frame.color_range, dst_color_range=2, interpolation="AREA", threads=1).to_ndarray().astype(np.float64) / 65535
+                                       src_colorspace="ITU601" if matrix in (5, 6) else "ITU709",
+                                       src_color_range=source_range, dst_color_range=2, interpolation="AREA", threads=1).to_ndarray().astype(np.float64) / 65535
         if frame.color_trc == 13:
             linear = srgb_to_linear(rgb)
         else:
@@ -194,6 +204,16 @@ def check_cancel(cancel):
 def sample_frame(context, time_s):
     target = context.index.pts[0] + time_s / context.index.tb
     return max(0, min(len(context.index.pts) - 1, bisect_right(context.index.pts, target) - 1))
+
+
+def sample_intervals(context, step):
+    for span, (first, end) in enumerate(context.color_ranges):
+        start, stop = context.frame_time(first), context.frame_time(end)
+        while start < stop:
+            # Keep the whole-video sample grid where possible for feature reuse.
+            next_time = min(stop, (start // step + 1) * step)
+            yield span, start, next_time
+            start = next_time
 
 
 def analyze_frame_palette(context, number, cache_dir=None, parameters=ColorParameters(), *, force=False):
@@ -233,7 +253,8 @@ def analyze_colors(context, cache_dir=None, parameters=ColorParameters(), cancel
     method_key = parameters.feature_key()
     timeline_method = {k: v for k, v in method.items() if k not in ('palette_colors', 'palette_iterations', 'palette', 'palette_positions', 'distance', 'color_change_rank_count')}
     shots_method = {k: v for k, v in method.items() if k != 'sample_step_s'}
-    timeline_key = digest([source_key, method_key, timeline_method, 'timeline'])
+    scope_key = [context.scope] if context.scoped else []
+    timeline_key = digest([source_key, method_key, timeline_method, 'timeline', *scope_key])
     shots_key = digest([source_key, method_key, shots_method, context.shot_revision, context.scope, 'shots'])
     source = None
     diagnostics = dict(decoded_samples=0, feature_cache_hits=0)
@@ -244,19 +265,21 @@ def analyze_colors(context, cache_dir=None, parameters=ColorParameters(), cancel
             from dataclasses import asdict
             from .color_summary import SummaryParameters, summarize
             summary_parameters = SummaryParameters()
-            summary_key = digest([source_key, method_key, timeline_method, asdict(summary_parameters)])
+            summary_key = digest([source_key, method_key, timeline_method, asdict(summary_parameters), *scope_key])
             summary = cache.result(summary_key)
         diagnostics.update(timeline_cache_hit=timeline is not None, shots_cache_hit=shots is not None)
         step = Fraction(str(parameters.sample_step_s))
-        times = list(grid(context.duration, step)) if timeline is None else []
-        timeline_numbers = [sample_frame(context, t) for t in times]
-        shot_samples = {s.shot_id: sorted({max(s.start_frame, min(s.end_frame_exclusive - 1, sample_frame(context, s.start + s.duration * f)))
+        intervals = list(sample_intervals(context, step)) if timeline is None else []
+        timeline_numbers = [sample_frame(context, t) for _, t, _ in intervals]
+        shot_samples = {s.key: sorted({max(s.start_frame, min(s.end_frame_exclusive - 1, sample_frame(context, s.start + s.duration * f)))
                                          for f in (Fraction(3, 20), Fraction(1, 2), Fraction(17, 20))}) for s in context.records} if shots is None else {}
         pairs = [(a, b) for block in contiguous_blocks(context.records) for a, b in zip(block, block[1:])] if shots is None else []
         summary_numbers = [s['source_frame'] for s in timeline['samples']] if include_summary and summary is None and timeline else []
         numbers = sorted(set(timeline_numbers + summary_numbers + [n for values in shot_samples.values() for n in values] +
                              [n for a, b in pairs for n in (a.end_frame_exclusive - 1, b.start_frame)]))
         features = {}
+        timeline_metadata = context.metadata(timeline_method, whole_video=not context.scoped)
+        timeline_metadata['shot_revision'] = None
         try:
             for done, number in enumerate(numbers, 1):
                 check_cancel(cancel)
@@ -278,29 +301,33 @@ def analyze_colors(context, cache_dir=None, parameters=ColorParameters(), cancel
             check_cancel(cancel)
             if timeline is None:
                 samples = []
-                for t, n in zip(times, timeline_numbers):
+                for (span, start, end), n in zip(intervals, timeline_numbers):
                     feature = features[n]
-                    samples.append(dict(video_time_s=float(t), end_time_s=float(min(context.duration, t + step)),
+                    samples.append(dict(video_time_s=float(start), end_time_s=float(end),
                                         source_frame=n, source_pts=context.index.pts[n], frame_time_s=float((context.index.pts[n] - context.index.pts[0]) * context.index.tb),
                                         srgb=rgb8(feature['mean_linear_rgb']), luminance=feature['luminance'], saturation=feature['saturation']))
-                timeline = dict(metadata=context.metadata(timeline_method, whole_video=True), samples=samples,
+                    if context.scoped:
+                        samples[-1]['span'] = span
+                def curve(metric):
+                    fields = ('video_time_s', 'source_frame', 'end_time_s', 'span') if context.scoped else ('video_time_s', 'source_frame')
+                    return [dict({key: s[key] for key in fields}, value=s[metric]) for s in samples]
+                timeline = dict(metadata=timeline_metadata, samples=samples,
                                 movie_barcode=[dict(video_time_s=s['video_time_s'], end_time_s=s['end_time_s'], srgb=s['srgb'], source_frame=s['source_frame']) for s in samples],
-                                luminance_series=[dict(video_time_s=s['video_time_s'], value=s['luminance'], source_frame=s['source_frame']) for s in samples],
-                                saturation_series=[dict(video_time_s=s['video_time_s'], value=s['saturation'], source_frame=s['source_frame']) for s in samples])
+                                luminance_series=curve('luminance'), saturation_series=curve('saturation'))
             if shots is None:
                 palettes = []
                 for shot in context.records:
                     check_cancel(cancel)
                     if cooperate:
                         cooperate()
-                    sampled = shot_samples[shot.shot_id]
+                    sampled = shot_samples[shot.key]
                     palettes.append(dict(shot.to_dict(), sampled_frames=sampled, sample_frame_count=len(sampled),
                                          colors=palette([features[n] for n in sampled], parameters.palette_colors, parameters.palette_iterations)))
                 distances = []
                 for a, b in pairs:
                     check_cancel(cancel)
-                    distances.append(dict(boundary_frame=b.start_frame, video_time_s=float(b.start), left_shot_id=a.shot_id,
-                                  right_shot_id=b.shot_id, left_frame=a.end_frame_exclusive - 1, right_frame=b.start_frame,
+                    distances.append(dict(boundary_frame=b.start_frame, video_time_s=float(b.start), left_shot_id=a.key,
+                                  right_shot_id=b.key, left_frame=a.end_frame_exclusive - 1, right_frame=b.start_frame,
                                   distance=color_distance(features[a.end_frame_exclusive - 1], features[b.start_frame], parameters.lab_bins)))
                 shots = dict(metadata=context.metadata(shots_method), shot_palette=palettes, cut_color_distance=distances,
                              largest_color_changes=sorted(distances, key=lambda x: (-x['distance'], x['video_time_s']))[:parameters.color_change_rank_count])
@@ -309,7 +336,7 @@ def analyze_colors(context, cache_dir=None, parameters=ColorParameters(), cancel
                 # Keep a cached group's own metadata independent of a later Shot scope.
                 if 'status' not in result:
                     warnings = sorted({w for n in used for w in features[n]['warnings']})
-                    status = 'empty' if quantized and not context.records else 'approximate' if warnings or quantized else 'ok'
+                    status = 'empty' if not used else 'approximate' if warnings or quantized else 'ok'
                     result.update(status=status, computed_at=datetime.now(timezone.utc).isoformat())
                     result['metadata']['warnings'] = sorted(set(result['metadata']['warnings'] + warnings))
                     result['metadata']['sample_dimensions'] = [list(size) for size in sorted({(features[n]['width'], features[n]['height']) for n in used})]
@@ -329,7 +356,7 @@ def analyze_colors(context, cache_dir=None, parameters=ColorParameters(), cancel
                 diagnostics.update(summary_diagnostics)
         except UnsupportedColor as error:
             failed = dict(status='unsupported', reason=str(error), metadata=context.metadata(shots_method))
-            return dict(video_color_timeline=timeline if timeline is not None else dict(failed, metadata=context.metadata(timeline_method, whole_video=True)), shot_color_statistics=failed,
+            return dict(video_color_timeline=timeline if timeline is not None else dict(failed, metadata=timeline_metadata), shot_color_statistics=failed,
                         performance=dict(diagnostics, elapsed_s=perf_counter() - began))
         finally:
             if source is not None:

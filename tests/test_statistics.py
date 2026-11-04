@@ -89,6 +89,31 @@ class ShotStatisticsTests(unittest.TestCase):
         self.assertEqual(build_context(p, index).shot_revision, revision)
         self.assertEqual(compute_shot_statistics(None, index)['status'], 'empty')
 
+    def test_frame_ranges_clip_vfr_shots_and_keep_gaps_out_of_rhythm(self):
+        _, index = example([1, 2, 3, 4, 5, 6, 7, 8])
+        shots = [Shot(id=f's{i}') for i in range(3)]
+        p = Project(8, [0, 3, 6, 8], shots, selected_id='s0')
+        scope = AnalysisScope('frame_ranges', frame_ranges=((1, 2), (2, 5), (4, 5), (6, 7)))
+        result = compute_shot_statistics(p, index, scope)
+        self.assertEqual(result['metadata']['scope']['frame_ranges'], [[1, 5], [6, 7]])
+        self.assertEqual([(s['start_frame'], s['end_frame_exclusive'], s['duration_s']) for s in result['shots']],
+                         [(1, 3, 5), (3, 5, 9), (6, 7, 7)])
+        overview, editing = result['overview'], result['editing']
+        self.assertEqual((overview['shot_count'], overview['scope_duration_s'], overview['asl_s']), (3, 21, 7))
+        self.assertEqual([c['boundary_frame'] for c in editing['boundaries']], [3])
+        self.assertEqual([r['sample_count'] for r in editing['rolling_asl_series']], [2, 2, 1])
+        self.assertFalse(any(15 <= r['video_time_s'] < 21 for r in editing['cut_density_series']))
+        self.assertEqual(result['special']['densest_cut_windows'][0]['end_time_s'], 15)
+        self.assertEqual(p.boundaries, [0, 3, 6, 8])
+
+        fragments = compute_shot_statistics(p, index, AnalysisScope('frame_ranges', frame_ranges=((0, 1), (2, 3))))
+        self.assertEqual([s['shot_id'] for s in fragments['shots']], ['s0', 's0'])
+        self.assertEqual(len({s['record_key'] for s in fragments['shots']}), 2)
+        self.assertEqual(fragments['overview']['asl_s'], 2)
+        self.assertEqual(fragments['editing']['boundaries'], [])
+        p.pending_start = 6
+        self.assertEqual(compute_shot_statistics(p, index, AnalysisScope('frame_ranges', frame_ranges=((6, 8),)))['status'], 'empty')
+
     def test_endpoint_estimation_and_bad_index_fail_explicitly(self):
         p, index = example([2, 3, 0], '1/10')
         context = build_context(p, index)

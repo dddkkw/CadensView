@@ -44,7 +44,7 @@ def shot_statistics(context, parameters=StatisticsParameters()):
         sums = [Fraction() for _ in histogram]
         for shot in records:
             i = int(shot.duration // bin_width)
-            histogram[i]["shot_ids"].append(shot.shot_id)
+            histogram[i]["shot_ids"].append(shot.key)
             sums[i] += shot.duration
         for row, duration in zip(histogram, sums):
             n = len(row["shot_ids"])
@@ -52,19 +52,21 @@ def shot_statistics(context, parameters=StatisticsParameters()):
     distribution = dict(duration_histogram=histogram, percentiles_s={f"p{p}": float(percentile(durations, p)) if count else None for p in (10, 25, 75, 90)})
     blocks = contiguous_blocks(records)
     cuts = [dict(boundary_frame=b.start_frame, left_frame=a.end_frame_exclusive - 1, right_frame=b.start_frame,
-                 left_shot_id=a.shot_id, right_shot_id=b.shot_id, video_time_s=float(b.start))
+                 left_shot_id=a.key, right_shot_id=b.key, video_time_s=float(b.start))
             for block in blocks for a, b in zip(block, block[1:])]
     cut_times = [b.start for block in blocks for b in block[1:]]
     rolling = []
-    for block in blocks:
+    for span, block in enumerate(blocks):
         prefix = [Fraction()]
         for shot in block:
             prefix.append(prefix[-1] + shot.duration)
         for i, shot in enumerate(block):
             first, end = max(0, i - (parameters.rolling_shots - 1) // 2), min(len(block), i + parameters.rolling_shots // 2 + 1)
-            rolling.append(dict(shot_id=shot.shot_id, video_time_s=float(shot.center), sample_count=end - first,
+            rolling.append(dict(shot_id=shot.key, video_time_s=float(shot.center), sample_count=end - first,
                                 asl_s=float((prefix[end] - prefix[first]) / (end - first)),
-                                first_shot_id=block[first].shot_id, last_shot_id=block[end - 1].shot_id))
+                                first_shot_id=block[first].key, last_shot_id=block[end - 1].key))
+            if context.scoped:
+                rolling[-1]['span'] = span
     def window(first, end):
         first, end = max(Fraction(), first), min(context.duration, end)
         covered = sum((max(Fraction(), min(end, b[-1].end) - max(first, b[0].start)) for b in blocks), Fraction())
@@ -72,32 +74,43 @@ def shot_statistics(context, parameters=StatisticsParameters()):
         return dict(start_time_s=float(first), end_time_s=float(end), effective_window_seconds=float(covered),
                     cut_count=right - left, cuts_per_minute=float((right - left) * 60 / covered) if covered else None), cuts[left:right]
     half = Fraction(str(parameters.density_window_s)) / 2
-    density = [dict(window(t - half, t + half)[0], video_time_s=float(t)) for t in grid(context.duration, Fraction(str(parameters.time_step_s)))]
+    density = []
+    ranges = [(b[0].start, b[-1].end) for b in blocks] if context.scoped else [(Fraction(), context.duration)]
+    for span, (first, end) in enumerate(ranges):
+        for offset in grid(end - first, Fraction(str(parameters.time_step_s))):
+            t = first + offset
+            density.append(dict(window(max(first, t - half), min(end, t + half))[0], video_time_s=float(t)))
+            if context.scoped:
+                density[-1]['span'] = span
     segments = []
     for first in grid(context.duration, Fraction(str(parameters.segment_s))):
         end = min(context.duration, first + Fraction(str(parameters.segment_s)))
         data, _ = window(first, end)
         members = [s for s in records if first <= s.center < end]
-        data.update(shot_count=len(members), shot_ids=[s.shot_id for s in members],
+        if context.scoped and not data['effective_window_seconds']:
+            continue
+        data.update(shot_count=len(members), shot_ids=[s.key for s in members],
                     asl_s=float(sum((s.duration for s in members), Fraction()) / len(members)) if members else None)
         segments.append(data)
-    width = min(context.duration, Fraction(str(parameters.dense_window_s)))
-    last_start = context.duration - width
     # Starting at the first included cut cannot lose any cut from an earlier
     # window. Exact cut candidates prevent a sub-second burst falling between grid points.
-    starts = sorted(set([*grid(last_start, Fraction(str(parameters.dense_step_s))), last_start,
-                         *(t for t in cut_times if t <= last_start)]))
     candidates = []
-    for first in starts:
-        data, events = window(first, first + width)
-        if events:
-            candidates.append((first, dict(data, boundaries=events)))
+    for begin, end in ranges:
+        width = min(end - begin, Fraction(str(parameters.dense_window_s)))
+        last_start = end - width
+        starts = {begin + offset for offset in grid(last_start - begin, Fraction(str(parameters.dense_step_s)))}
+        starts.update(cut_times[bisect_left(cut_times, begin):bisect_left(cut_times, last_start)])
+        starts.add(last_start)
+        for first in starts:
+            data, events = window(first, first + width)
+            if events:
+                candidates.append((first, first + width, dict(data, boundaries=events)))
     dense = []
-    dense_starts = []
-    for first, candidate in sorted(candidates, key=lambda x: (-x[1]["cut_count"], x[0])):
-        if all(max(Fraction(), min(first + width, old + width) - max(first, old)) <
-               Fraction(str(parameters.dense_max_overlap)) * width for old in dense_starts):
-            dense.append(candidate); dense_starts.append(first)
+    chosen = []
+    for first, end, candidate in sorted(candidates, key=lambda x: (-x[2]["cut_count"], x[0])):
+        if all(max(Fraction(), min(end, b) - max(first, a)) <
+               Fraction(str(parameters.dense_max_overlap)) * min(end - first, b - a) for a, b in chosen):
+            dense.append(candidate); chosen.append((first, end))
             if len(dense) == parameters.dense_count:
                 break
     runs = []
@@ -111,7 +124,7 @@ def shot_statistics(context, parameters=StatisticsParameters()):
             if len(group) >= parameters.short_run_min:
                 runs.append(dict(start_frame=group[0].start_frame, end_frame_exclusive=group[-1].end_frame_exclusive,
                                  start_time_s=float(group[0].start), end_time_s=float(group[-1].end),
-                                 shot_count=len(group), duration_s=float(group[-1].end - group[0].start), shot_ids=[s.shot_id for s in group]))
+                                 shot_count=len(group), duration_s=float(group[-1].end - group[0].start), shot_ids=[s.key for s in group]))
             group = []
     methods = dict(asdict(parameters), percentiles="Hyndman-Fan type 7 (linear)", standard_deviation="population",
                    even_rolling_window="extra sample after center", density_denominator="covered time inside window",

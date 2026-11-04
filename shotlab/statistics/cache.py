@@ -25,7 +25,7 @@ class ColorCache:
                 PRIMARY KEY(source, method, frame));
             CREATE TABLE IF NOT EXISTS results (key TEXT PRIMARY KEY, payload BLOB);
         """)
-        self.pending = 0
+        self.pending = {}
 
     @staticmethod
     def encode(value):
@@ -40,25 +40,37 @@ class ColorCache:
         return self.decode(row[0]) if row else None
 
     def publish(self, key, value):
-        self.connection.execute("INSERT OR REPLACE INTO results VALUES (?,?)", (key, self.encode(value)))
-        self.connection.commit()
-        self.pending = 0
+        payload = self.encode(value)
+        self.flush()
+        with self.connection:
+            self.connection.execute("INSERT OR REPLACE INTO results VALUES (?,?)", (key, payload))
 
     def feature(self, source, method, frame):
+        key = source, method, frame
+        if key in self.pending:
+            return self.decode(self.pending[key])
         row = self.connection.execute("SELECT payload FROM features WHERE source=? AND method=? AND frame=?",
-                                      (source, method, frame)).fetchone()
+                                      key).fetchone()
         return self.decode(row[0]) if row else None
 
     def remember(self, source, method, frame, feature):
-        self.connection.execute("INSERT OR REPLACE INTO features VALUES (?,?,?,?)", (source, method, frame, self.encode(feature)))
-        self.pending += 1
-        if self.pending >= 32:
-            self.connection.commit()
-            self.pending = 0
+        self.pending[source, method, frame] = self.encode(feature)
+        if len(self.pending) >= 32:
+            self.flush()
+
+    def flush(self):
+        if self.pending:
+            # Decode, clustering and foreground yields never hold this write lock.
+            with self.connection:
+                self.connection.executemany("INSERT OR REPLACE INTO features VALUES (?,?,?,?)",
+                    [(*key, payload) for key, payload in self.pending.items()])
+            self.pending.clear()
 
     def close(self):
-        self.connection.commit()  # Valid completed samples survive cancellation.
-        self.connection.close()
+        try:
+            self.flush()  # Valid completed samples survive cooperative cancellation.
+        finally:
+            self.connection.close()
 
     def __enter__(self):
         return self

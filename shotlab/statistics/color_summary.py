@@ -81,8 +81,9 @@ def representative_candidates(samples, features, bins, parameters):
     """Rank within each real-time sixth using its pixel distribution, not its mean RGB."""
     distributions = np.asarray([histogram(f, bins) for f in features])
     seconds = np.asarray([s['end_time_s'] - s['video_time_s'] for s in samples])
-    duration = samples[-1]['end_time_s']
-    times = np.asarray([s['frame_time_s'] for s in samples])
+    scoped = 'span' in samples[0]
+    duration = seconds.sum() if scoped else samples[-1]['end_time_s']
+    times = np.cumsum(seconds) - seconds if scoped else np.asarray([s['frame_time_s'] for s in samples])
     ranked = []
     for part in range(parameters.preview_count):
         first, end = duration * part / parameters.preview_count, duration * (part + 1) / parameters.preview_count
@@ -100,12 +101,13 @@ def representative_candidates(samples, features, bins, parameters):
             transition = luminance < .006 or luminance > .95
             # Single-sample flashes differ from both neighbors in an otherwise stable area.
             flash = False
-            if 0 < i < len(samples) - 1:
+            if 0 < i < len(samples) - 1 and (not scoped or samples[i-1]['span'] == samples[i]['span'] == samples[i+1]['span']):
                 neighbors = np.sqrt(distributions[[i - 1, i + 1]])
                 flash = np.linalg.norm(neighbors[0] - neighbors[1]) < .2 and np.linalg.norm(np.sqrt(distributions[i]) - neighbors.mean(axis=0)) > .8
             candidates.append((float(difference) + float(transition or flash), int(i)))
         candidates.sort()
-        ranked.append((first, end, candidates[:3]))
+        ranked.append((samples[indices[0]]['video_time_s'] if scoped else first,
+                       samples[indices[-1]]['end_time_s'] if scoped else end, candidates[:3]))
     return ranked
 
 
@@ -145,6 +147,8 @@ def summarize(context, timeline, features, cache, key, parameters=SummaryParamet
     if existing and all((folder / s['file']).is_file() for s in existing['representatives']):
         return existing, diagnostics
     samples = timeline['samples']
+    if not samples:
+        return dict(groups=[], representatives=[], status='empty', metadata=timeline['metadata']), diagnostics
     reader = None
     try:
         if existing:

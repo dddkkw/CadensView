@@ -1,6 +1,6 @@
 """Read-only analysis inputs and shared source-frame/time coordinates."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 import hashlib
 import json
@@ -20,6 +20,17 @@ class AnalysisScope:
     kind: str = "whole_video"
     shot_ids: tuple[str, ...] = ()
     time_ranges: tuple[tuple[float, float], ...] = ()
+    frame_ranges: tuple[tuple[int, int], ...] = ()
+
+
+def merge_ranges(ranges):
+    merged = []
+    for first, end in sorted(ranges):
+        if merged and first <= merged[-1][1]:
+            merged[-1] = merged[-1][0], max(end, merged[-1][1])
+        else:
+            merged.append((first, end))
+    return merged
 
 
 @dataclass(frozen=True)
@@ -58,6 +69,11 @@ class ShotRecord:
     end_pts_exclusive: int
     origin_pts: int
     time_base: Fraction
+    clipped: bool = False
+
+    @property
+    def key(self):
+        return f'{self.shot_id}:{self.start_frame}' if self.clipped else self.shot_id
 
     @property
     def start(self):
@@ -76,11 +92,14 @@ class ShotRecord:
         return (self.start + self.end) / 2
 
     def to_dict(self):
-        return dict(shot_id=self.shot_id, shot_number=self.shot_number, start_frame=self.start_frame,
+        result = dict(shot_id=self.shot_id, shot_number=self.shot_number, start_frame=self.start_frame,
                     end_frame_exclusive=self.end_frame_exclusive, frame_count=self.end_frame_exclusive - self.start_frame,
                     start_pts=self.start_pts, end_pts_exclusive=self.end_pts_exclusive,
                     start_time_s=float(self.start), end_time_s=float(self.end), video_time_s=float(self.center),
                     duration_s=float(self.duration))
+        if self.clipped:
+            result['record_key'] = self.key
+        return result
 
 
 def contiguous_blocks(records):
@@ -107,6 +126,20 @@ class AnalysisContext:
     def duration(self):
         return (self.end_pts - self.index.pts[0]) * self.index.tb
 
+    def frame_time(self, frame):
+        pts = self.index.pts[frame] if frame < len(self.index.pts) else self.end_pts
+        return (pts - self.index.pts[0]) * self.index.tb
+
+    @property
+    def scoped(self):
+        return self.scope['kind'] == 'frame_ranges'
+
+    @property
+    def color_ranges(self):
+        if not self.scoped:
+            return [(0, len(self.index.pts))]
+        return [(r['start_frame'], r['end_frame_exclusive']) for r in self.scope['covered_ranges']]
+
     def metadata(self, parameters, *, whole_video=False):
         scope = self.scope
         warnings = list(self.warnings)
@@ -124,22 +157,24 @@ class AnalysisContext:
                     warnings=warnings)
 
 
+def display_endpoint(index):
+    last_duration = index.durations[-1] if index.durations else 0
+    if last_duration > 0:
+        return index.pts[-1] + last_duration, 'indexed'
+    if len(index.pts) == 1:
+        raise ValueError("The single frame has no trustworthy display endpoint")
+    # Only the last display interval is estimated, never from container/audio duration.
+    differences = sorted(b - a for a, b in zip(index.pts, index.pts[1:]))
+    duration = round(Fraction(differences[(len(differences) - 1) // 2] + differences[len(differences) // 2], 2))
+    return index.pts[-1] + duration, 'estimated'
+
+
 def build_context(project: Project | None, index: FrameIndex, scope=AnalysisScope()) -> AnalysisContext:
     """Build facts from the committed partition, never from detector candidates or pixels."""
     if not index.pts or index.tb <= 0 or any(a >= b for a, b in zip(index.pts, index.pts[1:])):
         raise ValueError("Analysis requires a nonempty, strictly increasing display PTS index")
-    warnings = []
-    last_duration = index.durations[-1] if index.durations else 0
-    quality = "indexed"
-    if last_duration <= 0:
-        if len(index.pts) == 1:
-            raise ValueError("The single frame has no trustworthy display endpoint")
-        # Only the last display interval is estimated, never from container/audio duration.
-        differences = sorted(b - a for a, b in zip(index.pts, index.pts[1:]))
-        last_duration = round(Fraction(differences[(len(differences) - 1) // 2] + differences[len(differences) // 2], 2))
-        quality = "estimated"
-        warnings.append("Final frame duration estimated from rounded median indexed PTS interval")
-    end_pts = index.pts[-1] + last_duration
+    end_pts, quality = display_endpoint(index)
+    warnings = ["Final frame duration estimated from rounded median indexed PTS interval"] if quality == 'estimated' else []
     records = []
     if project is not None:
         project.validate()
@@ -160,16 +195,24 @@ def build_context(project: Project | None, index: FrameIndex, scope=AnalysisScop
         ranges = [(Fraction(str(a)), Fraction(str(b))) for a, b in scope.time_ranges]
         if any(not 0 <= a < b for a, b in ranges):
             raise ValueError("Time ranges must be positive half-open source intervals")
-        merged = []
-        for first, end in sorted(ranges):
-            if merged and first <= merged[-1][1]:
-                merged[-1] = merged[-1][0], max(end, merged[-1][1])
-            else:
-                merged.append((first, end))
+        merged = merge_ranges(ranges)
         records = [s for s in records if any(a <= s.start and s.end <= b for a, b in merged)]
         warnings.append("Time range scope includes only fully contained complete Shots; no partial Shot slicing")
+    elif scope.kind == 'frame_ranges':
+        if any(type(a) is not int or type(b) is not int or not 0 <= a < b <= len(index.pts) for a, b in scope.frame_ranges):
+            raise ValueError('Frame ranges must be half-open intervals inside the source')
+        merged = merge_ranges(scope.frame_ranges)
+        clipped = []
+        for a, b in merged:
+            for shot in records:
+                first, end = max(a, shot.start_frame), min(b, shot.end_frame_exclusive)
+                if first < end:
+                    clipped.append(replace(shot, start_frame=first, end_frame_exclusive=end,
+                                           start_pts=index.pts[first], end_pts_exclusive=index.pts[end] if end < len(index.pts) else end_pts,
+                                           clipped=(first, end) != (shot.start_frame, shot.end_frame_exclusive)))
+        records = clipped
     elif scope.kind != "whole_video":
-        raise ValueError("Unsupported scope; OP/ED exclusion requires future explicit content regions")
+        raise ValueError("Unsupported analysis scope")
     complete = bool(project and project.pending_start is None and index.complete)
     if not complete:
         warnings.append("Incomplete project/index: Shot results describe completed coverage only")
@@ -180,6 +223,8 @@ def build_context(project: Project | None, index: FrameIndex, scope=AnalysisScop
                       scope_duration_s=float(sum((s.duration for s in records), Fraction())),
                       pending_start_frame=project.pending_start if project else 0,
                       range_policy="whole_shots_fully_contained")
+    if scope.kind == 'frame_ranges':
+        scope_data.update(frame_ranges=[list(r) for r in merged], range_policy='clipped_shot_fragments')
     identity = {k: v for k, v in asdict(index).items() if k != "elapsed"}
     source = dict(key=digest(identity), path=str(Path(index.path).resolve()), size=index.size, mtime_ns=index.mtime_ns,
                   time_base=index.time_base, origin_pts=index.pts[0], frame_count=len(index.pts), index_complete=index.complete)

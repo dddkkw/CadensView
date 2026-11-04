@@ -1,6 +1,6 @@
 """Synthetic pixel definitions, source sampling, caching and process isolation."""
 
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from contextlib import closing
 from copy import deepcopy
 from dataclasses import replace
@@ -20,6 +20,7 @@ from shotlab.statistics import AnalysisScope, analysis_bundle, build_context, co
 from shotlab.statistics.colors import (ColorParameters, ColorSource, analyze_colors, analyze_frame_palette, color_distance,
                                        color_features, palette, rgb8, sample_frame, linear_to_lab)
 from shotlab.statistics.worker import ColorWorker
+from shotlab.statistics.cache import ColorCache
 from t0.media import build_index
 
 
@@ -171,6 +172,34 @@ class ColorPipelineTests(unittest.TestCase):
             tiny = analyze_colors(build_context(p, index), directory)
             self.assertEqual(tiny['shot_color_statistics']['shot_palette'][0]['sample_frame_count'], 1)
 
+    def test_scoped_colors_use_only_included_frames_and_reuse_timeline_after_edit(self):
+        scope = AnalysisScope('frame_ranges', frame_ranges=((4, 9), (8, 20), (30, 38)))
+        context = build_context(self.project, self.index, scope)
+        parameters = ColorParameters(sample_step_s=.25)
+        with TemporaryDirectory() as directory:
+            whole = analyze_colors(build_context(self.project, self.index), directory, parameters, include_summary=True)
+            result = analyze_colors(context, directory, parameters, include_summary=True)
+            timeline, shot_colors = result['video_color_timeline'], result['shot_color_statistics']
+            samples = timeline['samples']
+            self.assertEqual({s['span'] for s in samples}, {0, 1})
+            included = lambda n: 4 <= n < 20 or 30 <= n < 38
+            self.assertTrue(all(included(s['source_frame']) for s in samples))
+            self.assertAlmostEqual(sum(s['end_time_s'] - s['video_time_s'] for s in samples), context.scope['scope_duration_s'])
+            self.assertTrue(all(included(s['source_frame']) for s in result['video_color_summary']['representatives']))
+            self.assertEqual([c['boundary_frame'] for c in shot_colors['cut_color_distance']], [12, 36])
+            self.assertTrue(all(p['start_frame'] <= n < p['end_frame_exclusive'] for p in shot_colors['shot_palette'] for n in p['sampled_frames']))
+            self.assertNotEqual(timeline, whole['video_color_timeline'])
+            with self.assertRaises(ValueError):
+                analysis_bundle(compute_shot_statistics(self.project, self.index), result)
+            edited = deepcopy(self.project); edited.move_boundary(1, 13)
+            updated = analyze_colors(build_context(edited, self.index, scope), directory, parameters, include_summary=True)
+            self.assertEqual(updated['video_color_timeline'], timeline)
+            self.assertTrue(updated['performance']['timeline_cache_hit'])
+            self.assertTrue(updated['performance']['summary_cache_hit'])
+            self.assertFalse(updated['performance']['shots_cache_hit'])
+            self.assertEqual([c['boundary_frame'] for c in updated['shot_color_statistics']['cut_color_distance']], [13, 36])
+            analysis_bundle(compute_shot_statistics(edited, self.index, scope), updated)
+
     def test_cancel_keeps_samples_but_does_not_publish_incomplete_results(self):
         cancel = Event()
         context = build_context(self.project, self.index)
@@ -183,6 +212,33 @@ class ColorPipelineTests(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT count(*) FROM results').fetchone()[0], 0)
             result = analyze_colors(context, directory)
             self.assertGreaterEqual(result['performance']['feature_cache_hits'], 2)
+
+    def test_palette_preview_can_publish_while_background_sampling_is_paused(self):
+        context = build_context(self.project, self.index)
+        sampled, resume = Event(), Event()
+        remember = ColorCache.remember
+
+        def pause_after_sample(cache, *args):
+            remember(cache, *args)
+            if not sampled.is_set():
+                sampled.set()
+                if not resume.wait(5):
+                    raise TimeoutError('preview did not release background sampling')
+
+        with TemporaryDirectory() as directory, ThreadPoolExecutor(max_workers=1) as pool:
+            with patch.object(ColorCache, 'remember', pause_after_sample):
+                future = pool.submit(analyze_colors, context, directory)
+                try:
+                    self.assertTrue(sampled.wait(5))
+                    preview = analyze_frame_palette(context, 0, directory)
+                    self.assertFalse(future.done())
+                    self.assertEqual(preview['source_pts'], self.index.pts[0])
+                    self.assertGreater(preview['colors'][0]['srgb'][0], 240)
+                finally:
+                    resume.set()
+                result = future.result(timeout=10)
+            self.assertEqual([s['source_frame'] for s in result['video_color_timeline']['samples']], [0, 24])
+            self.assertEqual(analyze_frame_palette(context, 0, directory)['colors'], preview['colors'])
 
     def test_hdr_is_explicitly_unsupported_and_movie_timeline_is_shot_independent(self):
         source = ColorSource(self.index, ColorParameters())
