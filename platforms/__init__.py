@@ -1,0 +1,1 @@
+"""Platform-specific desktop integration."""

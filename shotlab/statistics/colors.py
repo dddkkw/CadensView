@@ -12,6 +12,7 @@ from av.video.reformatter import VideoReformatter
 import numpy as np
 
 from t0.media import FrameReader
+from t0.display import sample_size, quarter_turns
 from .cache import ColorCache
 from .model import contiguous_blocks, digest
 
@@ -152,8 +153,6 @@ class ColorSource:
 
     def read(self, number):
         frame = self.reader.read(number)
-        if frame.rotation or self.reader.stream.sample_aspect_ratio not in (None, 0, 1):
-            raise UnsupportedColor("Rotation / non-square pixels are not certified for color analysis")
         if frame.color_trc in (16, 18) or frame.color_primaries == 9 or frame.colorspace in (9, 10):
             raise UnsupportedColor("HDR / BT.2020 analysis is unsupported; no SDR tone mapping is assumed")
         if frame.color_trc not in (1, 2, 6, 13) or frame.color_primaries not in (1, 2):
@@ -176,18 +175,23 @@ class ColorSource:
             warnings.append("Unspecified primaries: assume Rec.709/sRGB D65")
         if frame.color_trc == 2:
             warnings.append("Unspecified SDR transfer: assume inverse BT.709 OETF")
-        width = min(frame.width, self.parameters.sample_width)
-        height = max(1, round(frame.height * width / frame.width))
+        sar = self.reader.stream.sample_aspect_ratio
+        try:
+            width, height = sample_size(frame, sar, self.parameters.sample_width)
+        except ValueError as error:
+            raise UnsupportedColor(str(error)) from error
         rgb = self.reformatter.reformat(frame, width=width, height=height, format="rgb48le",
                                        src_colorspace="ITU601" if matrix in (5, 6) else "ITU709",
                                        src_color_range=source_range, dst_color_range=2, interpolation="AREA", threads=1).to_ndarray().astype(np.float64) / 65535
+        rgb = np.rot90(rgb, quarter_turns(frame.rotation))
+        height, width = rgb.shape[:2]
         if frame.color_trc == 13:
             linear = srgb_to_linear(rgb)
         else:
             # Explicit inverse OETF; PyAV's dst_color_trc only changes metadata.
             linear = np.where(rgb < .081, rgb / 4.5, ((rgb + .099) / 1.099) ** (1 / .45))
         feature = color_features(linear_to_srgb(linear), self.parameters.lab_bins, linear)
-        feature.update(width=width, height=height, warnings=warnings, source_pts=frame.pts,
+        feature.update(width=width, height=height, warnings=warnings, source_pts=self.reader.index.pts[number],
                        source_color=dict(matrix=frame.colorspace, range=frame.color_range,
                                          transfer=frame.color_trc, primaries=frame.color_primaries))
         return feature

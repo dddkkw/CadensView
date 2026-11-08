@@ -16,6 +16,9 @@ def run_worker(args):
     cancelled = Cancellation(Path(args.index).parent / 'cancel')
     if sys.platform == 'win32':
         ctypes.windll.kernel32.SetPriorityClass(ctypes.c_void_p(-1), 0x4000)
+    elif sys.platform == 'darwin':
+        from platforms.macos.processes import prepare_worker
+        prepare_worker(os.getppid())
     emit('loading', pid=os.getpid())
     try:
         from .detection.onnx_runtime import GPUError
@@ -70,7 +73,7 @@ def main():
     parser.add_argument('--index', required=True)
     parser.add_argument('--out', required=True)
     parser.add_argument('--weights', default=str(Path(sys.executable).parent / 'models/transnet-split.onnx'))
-    parser.add_argument('--device', choices=('auto', 'cpu', 'dml'), default='auto')
+    parser.add_argument('--device', choices=('auto', 'cpu', 'dml', 'coreml'), default='auto')
     parser.add_argument('--adapter', type=int)
     parser.add_argument('--device-cache', help='Optional writable device decision JSON; never stores a Session')
     parser.add_argument('--start', type=int, default=0)

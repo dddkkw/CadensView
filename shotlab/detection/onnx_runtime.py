@@ -13,10 +13,48 @@ import numpy as np
 
 MODEL_SHA256 = 'af5bc7dcbc517613d0d7fb39ee97add80e52a05d8de4717652e500a5bf573810'
 WEIGHTS_SHA256 = 'a313d0b3bebfa9a71914b375bfdf918a30b5c3b1e6be51972d35dd8078b442de'
+SELECTION_POLICY = 2
 
 
 class GPUError(RuntimeError):
     """The coordinator may retry once in a fresh CPU process."""
+
+
+OUTPUT_ROUNDOFF = float(np.finfo(np.float32).eps)
+
+
+def validate_outputs(values, device, providers, diagnostics=None):
+    """Validate both FP32 sigmoid heads; diagnostics contain no media or paths."""
+    if len(values) != 2:
+        raise RuntimeError(f'ONNX output count: expected=2 actual={len(values)} backend={device}')
+    outputs = []
+    for name, value in zip(('single', 'many'), values):
+        finite = np.isfinite(value)
+        valid = value[finite]
+        stats = dict(head=name, backend=device, providers=providers, shape=list(value.shape),
+                     dtype=str(value.dtype), min=float(valid.min()) if valid.size else None,
+                     max=float(valid.max()) if valid.size else None,
+                     nan=int(np.isnan(value).sum()), inf=int(np.isinf(value).sum()),
+                     below_zero=int((value < 0).sum()), above_one=int((value > 1).sum()),
+                     onnxruntime=(diagnostics or {}).get('onnxruntime'), architecture=platform.machine(),
+                     model_sha256=MODEL_SHA256)
+        reason = ('shape' if value.shape != (1, 100, 1) else 'dtype' if value.dtype != np.float32
+                  else 'nonfinite' if not finite.all()
+                  else 'range' if stats['min'] < -OUTPUT_ROUNDOFF or stats['max'] > 1 + OUTPUT_ROUNDOFF else None)
+        if reason:
+            raise RuntimeError('ONNX output ' + reason + ': ' + json.dumps(stats, allow_nan=False))
+        if stats['below_zero'] or stats['above_one']:
+            # ORT 1.20.1 ARM CPU Sigmoid's polynomial reaches +/- one FP32
+            # epsilon beyond its mathematical range. Verified by the native
+            # sigmoid probe. Endpoints are far from .5: responses cannot change.
+            if diagnostics is not None:
+                record = diagnostics.setdefault('output_roundoff', {}).setdefault(name, dict(values=0, min=0., max=1.))
+                record['values'] += stats['below_zero'] + stats['above_one']
+                record['min'] = min(record['min'], stats['min'])
+                record['max'] = max(record['max'], stats['max'])
+            value = np.clip(value, 0, 1)
+        outputs.append(value)
+    return outputs
 
 
 def color_histograms(frames):
@@ -58,6 +96,8 @@ def adapters():
                 if method(adapter, 10, W.LONG, C.POINTER(Desc))(adapter, C.byref(desc)):
                     continue
                 luid = f'{desc.luid.hi & 0xffffffff:08x}:{desc.luid.lo:08x}'
+                # Filter software adapters and identical DXGI identities, keeping
+                # raw ordinals. A model/PCI ID does not identify a physical board.
                 if not desc.flags & 2 and luid not in seen:
                     seen.add(luid)
                     # DXGI's documented UMD version query; never infer DML ids from CUDA.
@@ -77,7 +117,7 @@ def adapters():
 
 
 class OnnxSession:
-    def __init__(self, model, device='cpu', adapter=None, threads=4):
+    def __init__(self, model, device='cpu', adapter=None, threads=4, profile_prefix=None, provider_options=None):
         import onnxruntime as ort
         adapter = adapter if device == 'dml' else None
         self.device, self.adapter = device, adapter
@@ -86,42 +126,54 @@ class OnnxSession:
         options.inter_op_num_threads = 1
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.enable_mem_pattern = device != 'dml'
-        provider = 'DmlExecutionProvider' if device == 'dml' else 'CPUExecutionProvider'
+        provider = {'cpu': 'CPUExecutionProvider', 'dml': 'DmlExecutionProvider', 'coreml': 'CoreMLExecutionProvider'}[device]
+        if profile_prefix:
+            options.enable_profiling = True
+            options.profile_file_prefix = profile_prefix
         if device == 'dml':
             options.add_session_config_entry('session.disable_cpu_ep_fallback', '1')
         providers = [(provider, {'device_id': adapter['device_id']})] if device == 'dml' else [provider]
+        if device == 'coreml':
+            from platforms.macos.coreml import provider_options as coreml_options
+            providers = [(provider, provider_options or coreml_options()), 'CPUExecutionProvider']
         try:
-            self.session = ort.InferenceSession(str(model), sess_options=options, providers=providers)
-            self.session.disable_fallback()
-            if provider not in self.session.get_providers():
-                raise RuntimeError(f'Requested {provider}, got {self.session.get_providers()}')
+            session = ort.InferenceSession(str(model), sess_options=options, providers=providers)
+            session.disable_fallback()
+            active = session.get_providers()
+            if provider not in active:
+                raise RuntimeError(f'Requested {provider}, got {active}')
         except Exception as error:
             if device == 'dml':
                 raise GPUError(f'DirectML 初始化失败：{error}') from error
+            if device == 'coreml':
+                raise GPUError(f'Core ML initialization failed: {error}') from error
             raise
-        inputs = [(i.name, i.shape, i.type) for i in self.session.get_inputs()]
+        inputs = [(i.name, i.shape, i.type) for i in session.get_inputs()]
         if inputs != [('frames', [1, 100, 27, 48, 3], 'tensor(uint8)'),
                       ('histograms', [1, 100, 512], 'tensor(float)')]:
             raise ValueError('Expected the validated split FP32 TransNet model')
-        self.metadata = dict(onnxruntime=ort.__version__, providers=self.session.get_providers(),
-                             device_name=adapter['name'] if adapter else 'CPU', adapter=adapter)
+        self.session = session
+        self.metadata = dict(onnxruntime=ort.__version__, providers=active,
+                             device_name=adapter['name'] if adapter else 'Apple Core ML' if device == 'coreml' else 'CPU', adapter=adapter)
 
     def predict(self, frames):
         try:
             values = self.session.run(['single', 'many'],
                                       {'frames': frames, 'histograms': color_histograms(frames)})
-            if any(v.shape != (1, 100, 1) or not np.isfinite(v).all() or
-                   np.min(v) < 0 or np.max(v) > 1 for v in values):
-                raise RuntimeError('Invalid ONNX prediction')
-            return values
+            return validate_outputs(values, self.device, self.session.get_providers(), self.metadata)
         except Exception as error:
             if self.device == 'dml':
                 raise GPUError(f'DirectML 推理失败：{error}') from error
+            if self.device == 'coreml':
+                raise GPUError(f'Core ML inference failed: {error}') from error
             raise
 
 
 def select_session(model, mode, frames, threads=4, adapter_id=None, check=lambda: None, cache_path=None):
     """One warmup plus two synchronized real-input trials; require 15% benefit."""
+    if sys.platform == 'darwin':
+        from platforms.macos.coreml import select_session as select_coreml
+        return select_coreml(model, mode, frames, threads, check)
     if mode not in ('auto', 'cpu', 'dml'):
         raise ValueError('ONNX device must be auto, cpu or dml')
     if mode == 'cpu':
@@ -140,10 +192,15 @@ def select_session(model, mode, frames, threads=4, adapter_id=None, check=lambda
             raise GPUError('没有可用的 DirectML 硬件适配器')
         return OnnxSession(model, threads=threads), []
 
+    if mode == 'auto':
+        # One probe also excludes low-VRAM integrated adapters when a larger
+        # GPU is present. Distinct LUIDs may still represent identical models.
+        hardware = [max(hardware, key=lambda a: (a['dedicated_video_bytes'], -a['device_id']))]
+
     # Only a decision is persisted. Each task owns a new private Session.
-    identity = dict(policy=1, model=MODEL_SHA256, runtime=ort.__version__, threads=threads,
+    identity = dict(policy=SELECTION_POLICY, model=MODEL_SHA256, runtime=ort.__version__, threads=threads,
                     system=platform.version(), cpu=os.environ.get('PROCESSOR_IDENTIFIER', platform.processor()),
-                    hardware=[{k: a.get(k) for k in ('luid', 'name', 'hardware_id', 'driver_version')}
+                    hardware=[{k: a.get(k) for k in ('luid', 'name', 'hardware_id', 'driver_version', 'dedicated_video_bytes')}
                               for a in sorted(hardware, key=lambda a: a['luid'])])
     cache = Path(cache_path) if cache_path and mode == 'auto' and all(a.get('driver_version') for a in hardware) else None
     if cache:
@@ -158,8 +215,8 @@ def select_session(model, mode, frames, threads=4, adapter_id=None, check=lambda
                     selected.predict(frames)  # Validate a new Session before publishing any cut.
                     selected.metadata['selection_cache'] = 'hit'
                     return selected, saved['trials']
-        except (OSError, ValueError, KeyError, TypeError, GPUError):
-            pass  # A failed cached GPU is re-tested, then uses the existing CPU-process recovery.
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # Corrupt decision data can be replaced. GPUError reaches the CPU-worker retry.
 
     def trial(session):
         check()

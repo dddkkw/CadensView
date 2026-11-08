@@ -5,6 +5,7 @@ from concurrent.futures import CancelledError
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import time
 from typing import Protocol
@@ -12,7 +13,7 @@ from typing import Protocol
 import numpy as np
 from av.video.reformatter import VideoReformatter
 
-from t0.media import FrameIndex, FrameReader
+from t0.media import FrameIndex, FrameReader, atomic_write_json
 
 
 def index_digest(index: FrameIndex) -> str:
@@ -146,6 +147,9 @@ def save_result(result: DetectionResult, index: FrameIndex, directory):
     for item in data["boundaries"]:
         item["pts"] = index.pts[item["frame"]]
     data["score_file"] = "scores.npz"
-    np.savez_compressed(directory / "scores.npz", **result.scores)
-    (directory / "result.json").write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    # Publish the JSON only after the referenced scores have been flushed.
+    with (directory / "scores.npz").open("wb") as scores:
+        np.savez_compressed(scores, **result.scores)
+        scores.flush()
+        os.fsync(scores.fileno())
+    atomic_write_json(directory / "result.json", data, indent=2, allow_nan=False)

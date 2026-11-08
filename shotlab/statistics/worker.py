@@ -23,6 +23,9 @@ def _initialize(cancel, foreground, progress, parent_pid):
         exit_with_parent(parent_pid)
         kernel = ctypes.windll.kernel32
         kernel.SetPriorityClass(ctypes.c_void_p(-1), 0x4000)  # BELOW_NORMAL, pointer-sized pseudo handle
+    elif os.uname().sysname == 'Darwin':
+        from platforms.macos.processes import prepare_worker
+        prepare_worker(parent_pid)
 
 
 def _cooperate():

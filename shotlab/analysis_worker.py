@@ -45,6 +45,9 @@ def publish(boundaries, complete):
 
 
 def memory_usage():
+    if sys.platform == 'darwin':
+        import resource
+        return dict(peak_working_set_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     if sys.platform != 'win32':
         return {}
     import ctypes
@@ -64,7 +67,7 @@ def main():
     parser.add_argument('--index', required=True)
     parser.add_argument('--out', required=True)
     parser.add_argument('--weights', required=True)
-    parser.add_argument('--device', choices=('auto', 'cpu', 'dml'), default='auto')
+    parser.add_argument('--device', choices=('auto', 'cpu', 'dml', 'coreml'), default='auto')
     parser.add_argument('--backend', choices=('onnx',), default='onnx')
     parser.add_argument('--adapter', type=int)
     parser.add_argument('--device-cache')

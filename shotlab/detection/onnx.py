@@ -18,16 +18,27 @@ class OnnxDetector:
         self.device_cache = device_cache
 
     def detect(self, source, start, end):
+        try:
+            return self._detect(source, start, end)
+        except RuntimeError as error:
+            # Keep GPUError's type so the process coordinator can retry CPU once.
+            raise type(error)(f'{error}; window_base={self.window_base}; '
+                              f'source_frames=[{max(0, self.window_base-25)}, '
+                              f'{min(len(source.index.pts), self.window_base+75)})') from error
+
+    def _detect(self, source, start, end):
         began = time.perf_counter()
         if file_digest(self.model) != MODEL_SHA256:
             raise ValueError('ONNX model SHA256 mismatch; refusing to load')
         total = len(source.index.pts)
         grid_start, grid_end = window_grid(total, start, end)
+        self.window_base = grid_start
         one, many = [], []
         streaming = ClosedResponses(.5, 'midpoint')
         session, trials, setup_seconds, algorithm_seconds = None, [], 0.0, 0.0
         with closing(frame_windows(source, start, end)) as windows:
             for base, frames in windows:
+                self.window_base = base
                 if session is None:
                     setup = time.perf_counter()
                     session, trials = select_session(self.model, self.device, frames, self.threads,

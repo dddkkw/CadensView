@@ -111,8 +111,10 @@ def representative_candidates(samples, features, bins, parameters):
     return ranked
 
 
-def still_image(frame, width):
-    return frame.reformat(width=width, height=max(1, round(width * frame.height / frame.width)), format='rgb24').to_ndarray()
+def still_image(frame, width, sar=1):
+    from t0.display import sample_size, quarter_turns
+    w, h = sample_size(frame, sar, width, upscale=True)
+    return np.rot90(frame.reformat(width=w, height=h, format='rgb24').to_ndarray(), quarter_turns(frame.rotation)).copy()
 
 
 def image_penalty(image, previous):
@@ -161,7 +163,7 @@ def summarize(context, timeline, features, cache, key, parameters=SummaryParamet
                     if reader is None:
                         reader = FrameReader(context.index)
                         reader.stream.codec_context.thread_count = 1
-                    image = still_image(reader.read(still['source_frame']), parameters.preview_width)
+                    image = still_image(reader.read(still['source_frame']), parameters.preview_width, reader.stream.sample_aspect_ratio)
                     diagnostics['preview_decoded_frames'] += 1
                     write_png(folder / still['file'], image)
             return existing, diagnostics
@@ -178,7 +180,7 @@ def summarize(context, timeline, features, cache, key, parameters=SummaryParamet
                 if reader is None:
                     reader = FrameReader(context.index)
                     reader.stream.codec_context.thread_count = 1
-                image = still_image(reader.read(samples[i]['source_frame']), parameters.preview_width)
+                image = still_image(reader.read(samples[i]['source_frame']), parameters.preview_width, reader.stream.sample_aspect_ratio)
                 diagnostics['preview_decoded_frames'] += 1
                 choices.append((difference + image_penalty(image, previous), i, image))
             _, i, previous = min(choices, key=lambda choice: (choice[0], choice[1]))
