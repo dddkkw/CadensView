@@ -104,6 +104,21 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(source.pts, index.pts)
             other.close()
 
+    def test_browsing_saves_do_not_rewrite_unchanged_shots(self):
+        p, _, settings = self.store.load()
+        statements = []
+        self.store.connection.set_trace_callback(statements.append)
+        p.current_frame = 33
+        self.store.save(p, settings)
+        self.assertFalse(any("shots" in s for s in statements))
+        p.split(20)
+        self.store.save(p, settings)
+        self.assertTrue(any(s.startswith("DELETE FROM shots") for s in statements))
+        self.store.connection.set_trace_callback(None)
+        reopened = ProjectStore(self.path)
+        self.assertEqual(reopened.load()[0], p)
+        reopened.close()
+
     def test_unicode_project_path_and_note(self):
         path = self.root / "镜头 分析 日本語.shotlab"
         store = ProjectStore.create(path, self.index)

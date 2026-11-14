@@ -1,9 +1,10 @@
 """M1–M4: exact-time shot statistics, without decoding or Qt."""
 
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import asdict
 from fractions import Fraction
-from math import sqrt
+from math import floor, log2, sqrt
+from statistics import median
 from time import perf_counter
 
 from .model import AnalysisScope, StatisticsParameters, build_context, contiguous_blocks
@@ -23,6 +24,35 @@ def percentile(values, percent):
     return values[left] + fraction * (values[min(left + 1, len(values) - 1)] - values[left])
 
 
+def log_edges(records):
+    """Half-octave bin edges (2^(k/2) s) around the durations, never narrower than one frame.
+
+    Durations are whole frames; a narrower bin could only stay empty and comb the chart.
+    """
+    shortest, longest = min(s.duration for s in records), max(s.duration for s in records)
+    frame = float(median(s.duration / (s.end_frame_exclusive - s.start_frame) for s in records))
+    edges = [2 ** (k / 2) for k in range(floor(2 * log2(shortest)), floor(2 * log2(longest)) + 2)]
+    merged = [edges[0]]
+    for edge in edges[1:]:
+        if edge - merged[-1] >= frame or edge == edges[-1]:
+            merged.append(edge)
+    return merged
+
+
+def bin_rows(records, edges, total):
+    """[start, end) bins with the same fields for linear and logarithmic charts."""
+    rows = [dict(start_s=float(a), end_s=float(b), shot_ids=[], count=0, duration_s=0) for a, b in zip(edges, edges[1:])]
+    sums = [Fraction() for _ in rows]
+    for shot in records:
+        i = bisect_right(edges, shot.duration) - 1
+        rows[i]["shot_ids"].append(shot.key)
+        sums[i] += shot.duration
+    for row, duration in zip(rows, sums):
+        n = len(row["shot_ids"])
+        row.update(count=n, duration_s=float(duration), count_share=n / len(records), duration_share=float(duration / total))
+    return rows
+
+
 def shot_statistics(context, parameters=StatisticsParameters()):
     parameters.validate()
     began = perf_counter()
@@ -37,19 +67,10 @@ def shot_statistics(context, parameters=StatisticsParameters()):
                     msl_s=float(percentile(durations, 50)) if count else None, stddev_s=deviation,
                     cv=deviation / float(average) if average else None, longest_shots=longest, shortest_shots=shortest)
     bin_width = Fraction(str(parameters.histogram_bin_s))
-    histogram = []
-    if durations:
-        histogram = [dict(start_s=float(i * bin_width), end_s=float((i + 1) * bin_width), shot_ids=[],
-                          count=0, duration_s=0) for i in range(int(durations[-1] // bin_width) + 1)]
-        sums = [Fraction() for _ in histogram]
-        for shot in records:
-            i = int(shot.duration // bin_width)
-            histogram[i]["shot_ids"].append(shot.key)
-            sums[i] += shot.duration
-        for row, duration in zip(histogram, sums):
-            n = len(row["shot_ids"])
-            row.update(count=n, duration_s=float(duration), count_share=n / count, duration_share=float(duration / total))
-    distribution = dict(duration_histogram=histogram, percentiles_s={f"p{p}": float(percentile(durations, p)) if count else None for p in (10, 25, 75, 90)})
+    histogram = bin_rows(records, [i * bin_width for i in range(int(durations[-1] // bin_width) + 2)], total) if durations else []
+    log_histogram = bin_rows(records, log_edges(records), total) if durations else []
+    distribution = dict(duration_histogram=histogram, log_duration_histogram=log_histogram,
+                        percentiles_s={f"p{p}": float(percentile(durations, p)) if count else None for p in (10, 25, 75, 90)})
     blocks = contiguous_blocks(records)
     cuts = [dict(boundary_frame=b.start_frame, left_frame=a.end_frame_exclusive - 1, right_frame=b.start_frame,
                  left_shot_id=a.key, right_shot_id=b.key, video_time_s=float(b.start))
@@ -127,6 +148,7 @@ def shot_statistics(context, parameters=StatisticsParameters()):
                                  shot_count=len(group), duration_s=float(group[-1].end - group[0].start), shot_ids=[s.key for s in group]))
             group = []
     methods = dict(asdict(parameters), percentiles="Hyndman-Fan type 7 (linear)", standard_deviation="population",
+                   log_histogram="half-octave bins [2^(k/2), 2^((k+1)/2)) s, merged to at least one frame",
                    even_rolling_window="extra sample after center", density_denominator="covered time inside window",
                    segment_shot_assignment="full Shot by midpoint", dense_candidates="source-time grid, every exact cut, and final full window")
     return dict(metadata=context.metadata(methods), status="ok" if records else "empty", shots=[s.to_dict() for s in records],

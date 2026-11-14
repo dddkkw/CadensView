@@ -11,7 +11,7 @@ import av
 from av.video.reformatter import VideoReformatter
 import numpy as np
 
-from t0.media import FrameReader
+from t0.media import BACKGROUND_THREADS, FrameReader
 from t0.display import sample_size, quarter_turns
 from .cache import ColorCache
 from .model import contiguous_blocks, digest
@@ -147,7 +147,8 @@ def color_distance(a, b, bins=(10, 16, 16)):
 class ColorSource:
     def __init__(self, index, parameters):
         self.reader = FrameReader(index, sequential=True)
-        self.reader.stream.codec_context.thread_count = 1
+        # Decoding is nearly all of the analysis time; the worker yields to the foreground.
+        self.reader.stream.codec_context.thread_count = BACKGROUND_THREADS
         self.reformatter = VideoReformatter()
         self.parameters = parameters
 

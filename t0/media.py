@@ -4,6 +4,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from concurrent.futures import CancelledError
 from fractions import Fraction
+from functools import lru_cache
 import json
 from math import lcm
 import os
@@ -12,6 +13,11 @@ from tempfile import NamedTemporaryFile
 import time
 
 import av
+
+
+# Background decoders (color analysis, thumbnails) use a quarter of the logical
+# CPUs, at most 4: 2-3x faster than one thread, leaving the rest to foreground work.
+BACKGROUND_THREADS = max(1, min(4, (os.cpu_count() or 4) // 4))
 
 
 def configure_video_decoder(stream):
@@ -35,6 +41,11 @@ def atomic_write_json(path, data, **options):
             temporary.unlink(missing_ok=True)
 
 
+@lru_cache(maxsize=None)
+def _rational(text):
+    return Fraction(text)
+
+
 @dataclass
 class FrameIndex:
     path: str
@@ -50,19 +61,25 @@ class FrameIndex:
 
     @property
     def tb(self):
-        return Fraction(self.time_base)
+        return _rational(self.time_base)
 
     @property
     def timestamp_quality(self):
         return "recovered" if "timestamp_recovery" in self.metadata else "exact"
 
+    def microseconds(self, ticks):
+        # Exactly round(ticks * tb * 1e6) (half to even), in integer arithmetic.
+        tb = self.tb
+        quotient, remainder = divmod(ticks * tb.numerator * 1_000_000, tb.denominator)
+        return quotient + (2 * remainder > tb.denominator or (2 * remainder == tb.denominator and quotient & 1))
+
     def us(self, frame):
-        return round(self.pts[frame] * self.tb * 1_000_000)
+        return self.microseconds(self.pts[frame])
 
     def end_us(self, frame):
         if frame + 1 < len(self.pts):
             return self.us(frame + 1)
-        return round((self.pts[frame] + self.durations[frame]) * self.tb * 1_000_000)
+        return self.microseconds(self.pts[frame] + self.durations[frame])
 
     def verify_source(self):
         stat = Path(self.path).stat()
@@ -278,11 +295,13 @@ class FrameReader:
             raise ValueError("Frame range outside the indexed source")
         if self.ordinal:
             return self.read_by_ordinal(start, end)
+        key = index.keys[max(0, bisect_right(index.keys, start) - 1)]
+        # Continue an open decoder when it is close, or already past the
+        # keyframe that a seek would restart from.
         reuse = (self.sequential and self.decoder is not None and self.next_frame is not None
-                 and self.next_frame <= start <= self.next_frame + 24)
+                 and self.next_frame <= start and (start <= self.next_frame + 24 or key < self.next_frame))
         base = index.tb
         if not reuse:
-            key = index.keys[max(0, bisect_right(index.keys, start) - 1)]
             offset = index.pts[key] if base == self.stream.time_base else (
                 index.pts[key] * base // self.stream.time_base)
             self.container.seek(offset, stream=self.stream, backward=True, any_frame=False)

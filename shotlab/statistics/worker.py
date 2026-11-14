@@ -28,9 +28,16 @@ def _initialize(cancel, foreground, progress, parent_pid):
         prepare_worker(parent_pid)
 
 
+_last_yield = 0.
+
+
 def _cooperate():
+    # In the foreground, yield as long as the work since the previous check
+    # took (about half duty), bounded so cancellation stays prompt.
+    global _last_yield
     if _foreground_event.is_set():
-        time.sleep(.04)
+        time.sleep(min(.25, max(.04, time.monotonic() - _last_yield)))
+    _last_yield = time.monotonic()
 
 
 def _progress(done, total):

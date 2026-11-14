@@ -8,7 +8,7 @@ CadensView 是一款面向动画爱好者、作画研究者与影像创作者的
 
 支持 Windows，所有视频处理与项目数据均保存在本地。
 
-当前核心源码对应 CadensView 0.3.0，版本变化见 [CHANGELOG](CHANGELOG.md#v030)。可下载的版本以 GitHub Releases 为准。
+当前核心源码对应 CadensView 0.3.1，版本变化见 [CHANGELOG](CHANGELOG.md#v031--2026-11-14)。可下载的版本以 GitHub Releases 为准。
 
 
 ## 功能介绍

@@ -1,6 +1,6 @@
 """Project editing rules; no Qt, decoder or storage dependency."""
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right, insort
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -22,6 +22,9 @@ class Project:
     # A pending tail reserves coverage, but is not a detected/editable Shot.
     # Completed projects retain the original full partition contract.
     pending_start: int | None = None
+    # Hand-picked representative frames as absolute source frames. A pick
+    # belongs to whichever Shot contains it, so edits never orphan it.
+    picks: list[int] = field(default_factory=list)
 
     @property
     def completed_count(self):
@@ -67,6 +70,8 @@ class Project:
             raise ValueError("Playback position outside source")
         if self.pending_start is not None and (self.pending_start != self.boundaries[-2] or self.shots[-1].note):
             raise ValueError("待分析尾段必须独立且不能有镜头笔记")
+        if self.picks != sorted(set(self.picks)) or any(type(f) is not int or not 0 <= f < self.frame_count for f in self.picks):
+            raise ValueError("Representative frames must be distinct source frames")
 
     def shot_at(self, frame: int) -> int:
         if not 0 <= frame < self.frame_count:
@@ -112,6 +117,20 @@ class Project:
         if not self.boundaries[boundary - 1] < frame < self.boundaries[boundary + 1]:
             raise ValueError("Both neighbouring Shots must retain at least one frame")
         self.boundaries[boundary] = frame
+
+    def picks_in(self, row: int) -> list[int]:
+        start, end = self.interval(row)
+        return self.picks[bisect_left(self.picks, start):bisect_left(self.picks, end)]
+
+    def toggle_pick(self, frame: int) -> bool:
+        """Add the frame as a representative, or remove it if already chosen."""
+        if self.shot_at(frame) >= self.completed_count:
+            raise ValueError("请等待此区域分析完成")
+        if frame in self.picks:
+            self.picks.remove(frame)
+            return False
+        insort(self.picks, frame)
+        return True
 
     def set_note(self, shot_id: str, text: str):
         row = self.row(shot_id)

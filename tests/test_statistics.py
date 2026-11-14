@@ -43,6 +43,26 @@ class ShotStatisticsTests(unittest.TestCase):
         self.assertEqual(result['shots'][-1]['end_pts_exclusive'], 130)
         self.assertEqual(len(result['editing']['boundaries']), 4)
 
+    def test_logarithmic_bins_count_every_shot_once_without_sub_frame_bins(self):
+        lengths = [1, 2, 3, 3, 12, 24, 30, 48, 100, 2112]  # frames at 24 fps; the last is 88 s
+        index = FrameIndex("not-opened.mkv", 0, 0, "1/24", list(range(sum(lengths))), [1] * sum(lengths), [0], True,
+                           {"duration_us": 999999999999}, 0)
+        shots = [Shot(id=f"s{i}") for i in range(len(lengths))]
+        cuts = [sum(lengths[:i]) for i in range(len(lengths) + 1)]
+        bins = compute_shot_statistics(Project(sum(lengths), cuts, shots, selected_id="s0"), index)['distribution']['log_duration_histogram']
+        self.assertEqual(sum(b['count'] for b in bins), len(lengths))
+        self.assertAlmostEqual(sum(b['count_share'] for b in bins), 1)
+        self.assertAlmostEqual(sum(b['duration_share'] for b in bins), 1)
+        self.assertTrue(all(a['end_s'] == b['start_s'] for a, b in zip(bins, bins[1:])))
+        self.assertTrue(all(b['end_s'] - b['start_s'] >= 1 / 24 for b in bins[:-1]))
+        for b in bins:
+            for shot in b['shot_ids']:
+                self.assertTrue(b['start_s'] <= lengths[int(shot[1:])] / 24 < b['end_s'])
+        # Equal ratios, so long and short shots share one readable chart instead of 44 linear bins.
+        self.assertLess(len(bins), 25)
+        self.assertLessEqual(bins[0]['start_s'], 1 / 24)
+        self.assertGreater(bins[-1]['end_s'], 88)
+
     def test_half_open_density_edges_and_midpoint_segments(self):
         p, index = example([30] * 5)
         result = compute_shot_statistics(p, index, parameters=StatisticsParameters(rolling_shots=5))
@@ -70,6 +90,8 @@ class ShotStatisticsTests(unittest.TestCase):
         self.assertEqual(empty['status'], 'empty')
         self.assertIsNone(empty['overview']['asl_s'])
         self.assertEqual(empty['distribution']['duration_histogram'], [])
+        self.assertEqual(empty['distribution']['log_duration_histogram'], [])
+        self.assertEqual(sum(b['count'] for b in result['distribution']['log_duration_histogram']), 3)
         partial = compute_shot_statistics(p, index, AnalysisScope('time_ranges', time_ranges=((10, 95),)))
         self.assertEqual([s['shot_id'] for s in partial['shots']], ['s1', 's2'])
         merged_ranges = compute_shot_statistics(p, index, AnalysisScope('time_ranges', time_ranges=((0, 40), (40, 60))))

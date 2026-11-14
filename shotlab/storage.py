@@ -20,6 +20,8 @@ class ProjectStore:
             self.connection.close()
             raise ValueError("Unsupported project version; file left unchanged")
         self.revision = self.connection.execute("SELECT revision FROM project").fetchone()[0]
+        # Shot rows as last read or written; browsing saves leave them untouched.
+        self.shot_rows = None
 
     @classmethod
     def create(cls, path: str | Path, index: FrameIndex, project: Project | None = None, settings: dict | None = None):
@@ -32,7 +34,7 @@ class ProjectStore:
             raise ValueError("Project partition does not match the source index")
         settings = {"audio_track": 0 if index.metadata["audio_tracks"] else -1,
                     "subtitle_path": "", **(settings or {})}
-        settings = dict(settings, pending_start=project.pending_start)
+        settings = dict(settings, pending_start=project.pending_start, representative_frames=project.picks)
         path = Path(path).resolve()
         # Exclusive creation also prevents accidental replacement of a video or
         # an existing project, regardless of extension.
@@ -67,21 +69,38 @@ class ProjectStore:
                 path.unlink()
         return cls(path)
 
+    @staticmethod
+    def summary(path: str | Path) -> dict:
+        """What a person needs to recognize a project, read without opening it for writing."""
+        path = Path(path).resolve()
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+        try:
+            raw_index, settings = connection.execute("SELECT media_index, settings FROM project").fetchone()
+            shots, notes = connection.execute("SELECT count(*), coalesce(sum(trim(note) != ''), 0) FROM shots").fetchone()
+        finally:
+            connection.close()
+        pending = json.loads(settings).get("pending_start") is not None
+        return dict(source=json.loads(raw_index)["path"], shots=shots - pending, notes=notes,
+                    modified=path.stat().st_mtime_ns // 1_000_000)
+
     def load(self) -> tuple[Project, FrameIndex, dict]:
         row = self.connection.execute("SELECT id,revision,media_index,current_frame,selected_id,settings FROM project").fetchone()
         project_id, self.revision, raw_index, current, selected, settings = row
         index = FrameIndex(**json.loads(raw_index))
         rows = self.connection.execute("SELECT id,start_frame,note FROM shots ORDER BY position").fetchall()
+        self.shot_rows = [(r[0], n, r[1], r[2]) for n, r in enumerate(rows)]
         settings = json.loads(settings)
         project = Project(len(index.pts), [r[1] for r in rows] + [len(index.pts)],
                           [Shot(r[0], r[2]) for r in rows], project_id, current, selected,
-                          settings.get('pending_start'))
+                          settings.get('pending_start'), settings.get('representative_frames', []))
         project.validate()
         return project, index, settings
 
     def save(self, project: Project, settings: dict, index: FrameIndex | None = None):
         project.validate()
-        settings = dict(settings, pending_start=project.pending_start)
+        # Stored with the settings: older versions keep the key untouched when they save.
+        settings = dict(settings, pending_start=project.pending_start, representative_frames=project.picks)
+        rows = [(shot.id, number, project.boundaries[number], shot.note) for number, shot in enumerate(project.shots)]
         with self.connection:
             changed = self.connection.execute(
                 "UPDATE project SET revision=revision+1,current_frame=?,selected_id=?,settings=? WHERE revision=?",
@@ -90,11 +109,11 @@ class ProjectStore:
                 raise SaveConflict("Project was saved by another instance; reopen it or save a backup")
             if index is not None:
                 self.connection.execute("UPDATE project SET media_index=?", (json.dumps(index.__dict__, ensure_ascii=False),))
-            self.connection.execute("DELETE FROM shots")
-            self.connection.executemany("INSERT INTO shots VALUES (?,?,?,?)", [
-                (shot.id, number, project.boundaries[number], shot.note)
-                for number, shot in enumerate(project.shots)])
+            if rows != self.shot_rows:
+                self.connection.execute("DELETE FROM shots")
+                self.connection.executemany("INSERT INTO shots VALUES (?,?,?,?)", rows)
         self.revision += 1
+        self.shot_rows = rows
 
     def backup(self, path: str | Path, project: Project, settings: dict):
         path = Path(path).resolve()

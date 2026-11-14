@@ -116,6 +116,38 @@ def adapters():
     return result
 
 
+def free_video_bytes(adapter):
+    """Dedicated VRAM not used by any process on this adapter, or None if unknown.
+
+    DXGI budgets are per process; only the system GPU memory counters
+    (Windows 10 1709+) include the desktop and other windows' workers.
+    """
+    if sys.platform != 'win32':
+        return None
+    class Item(C.Structure):
+        _fields_ = [('name', W.LPWSTR), ('status', W.DWORD), ('value', C.c_longlong)]
+    pdh = C.WinDLL('pdh.dll')
+    query, counter = C.c_void_p(), C.c_void_p()
+    if pdh.PdhOpenQueryW(None, None, C.byref(query)):
+        return None
+    try:
+        if (pdh.PdhAddEnglishCounterW(query, '\\GPU Adapter Memory(*)\\Dedicated Usage', None, C.byref(counter))
+                or pdh.PdhCollectQueryData(query)):
+            return None
+        size, count = W.DWORD(), W.DWORD()
+        pdh.PdhGetFormattedCounterArrayW(counter, 0x400, C.byref(size), C.byref(count), None)  # PDH_FMT_LARGE
+        items = (C.c_byte * size.value)()
+        if pdh.PdhGetFormattedCounterArrayW(counter, 0x400, C.byref(size), C.byref(count), items):
+            return None
+        hi, lo = adapter['luid'].split(':')
+        prefix = f'luid_0x{hi}_0x{lo}_'
+        used = sum(item.value for item in C.cast(items, C.POINTER(Item))[:count.value]
+                   if item.name.lower().startswith(prefix) and item.status in (0, 1))
+        return max(0, adapter['dedicated_video_bytes'] - used)
+    finally:
+        pdh.PdhCloseQuery(query)
+
+
 class OnnxSession:
     def __init__(self, model, device='cpu', adapter=None, threads=4, profile_prefix=None, provider_options=None):
         import onnxruntime as ort
